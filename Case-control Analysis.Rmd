@@ -1,0 +1,153 @@
+---
+title: "Case-control Analysis"
+author: "Shuyi Ji"
+date: "2026-03-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(MatchIt)
+library(survival)
+library(dplyr)
+library(pbapply)
+library(parallel)
+
+target_data <- Vacc2year
+
+# List of 11 pathogens to iterate through
+pathogens_list <- c("InfA", "InfB", "HPIV", "HADV", "Ch", "HRV", "HMPV", "HCOV", "HRSV", "Mp", "Boca")
+
+# Fixed baseline matching covariates
+base_covariates <- c("Gender_num", "Age_years", "Month_num", "Type")
+
+# Define the analysis function for Bootstrap/Iterations
+analyze_once <- function(i, pathogen, formula_str, exact_formula_str) {
+  # Shuffle data order to ensure randomness in nearest neighbor matching
+  shuffled_data <- target_data[sample(nrow(target_data)), ]
+  
+  # Perform matching
+  matched_data <- matchit(
+    as.formula(formula_str),
+    data = shuffled_data,
+    method = "nearest",
+    distance = "glm",
+    ratio = 1,
+    exact = as.formula(exact_formula_str),
+    discard = "both",
+    replace = FALSE,
+    caliper = 0.01
+  )
+
+  # Extract matched dataset
+  matched_df <- match.data(matched_data)
+
+  # Return NA if matching fails to find any pairs
+  if (nrow(matched_df) == 0) {
+    return(data.frame(
+      Iteration = i, Pathogen = pathogen, OR = NA, Lower_CI = NA, Upper_CI = NA, 
+      P_value = NA, N_cases = NA, N_controls = NA
+    ))
+  }
+
+  # Retain strict 1:1 subclasses (one case and one control per subclass)
+  matched_df <- matched_df %>%
+    group_by(subclass) %>%
+    filter(n() == 2, sum(!!sym(pathogen)) == 1) %>% 
+    ungroup()
+
+  # Re-check after filtering subclasses
+  if (nrow(matched_df) == 0) {
+    return(data.frame(
+      Iteration = i, Pathogen = pathogen, OR = NA, Lower_CI = NA, Upper_CI = NA, 
+      P_value = NA, N_cases = NA, N_controls = NA
+    ))
+  }
+
+  # Conditional Logistic Regression
+  result_df <- tryCatch({
+    model <- clogit(
+      as.formula(paste(pathogen, "~ Pre_vaccination + strata(subclass)")),
+      data = matched_df
+    )
+    
+    # Extract results
+    OR <- exp(coef(model))
+    OR_CI <- exp(confint(model))
+    p_val <- summary(model)$coefficients["Pre_vaccination", "Pr(>|z|)"]
+
+    data.frame(
+      Iteration = i, 
+      Pathogen = pathogen, 
+      OR = OR, 
+      Lower_CI = OR_CI[1], 
+      Upper_CI = OR_CI[2], 
+      P_value = p_val,
+      N_cases = sum(matched_df[[pathogen]] == 1), 
+      N_controls = sum(matched_df[[pathogen]] == 0)
+    )
+  }, error = function(e) {
+    data.frame(
+      Iteration = i, Pathogen = pathogen, OR = NA, Lower_CI = NA, Upper_CI = NA, 
+      P_value = NA, N_cases = sum(matched_df[[pathogen]] == 1), N_controls = sum(matched_df[[pathogen]] == 0)
+    )
+  })
+
+  return(result_df)
+}
+
+# 3. Start Parallel Computing
+n_cores <- floor(detectCores() / 2)
+message("Starting parallel computation using core count: ", n_cores)
+
+cl <- makeCluster(n_cores)
+
+# Load required packages on each worker node
+clusterEvalQ(cl, {
+  library(MatchIt)
+  library(survival)
+  library(dplyr)
+})
+
+# Distribute external data (target_data) and function to worker nodes
+clusterExport(cl, varlist = c("target_data", "analyze_once"))
+
+# Loop through the 11 pathogens
+all_results <- list()
+
+for (pathogen in pathogens_list) {
+  message("\n==================================")
+  message("Processing pathogen: ", pathogen)
+  
+  # Identify the other 10 pathogens to be used as covariates
+  other_pathogens <- setdiff(pathogens_list, pathogen)
+  
+  # Matching formula: base variables + remaining 10 pathogens
+  matching_covariates <- c(base_covariates, other_pathogens)
+  
+  # Pre-construct formula strings for matchit
+  formula_str <- paste(pathogen, "~", paste(matching_covariates, collapse = " + "))
+  exact_formula_str <- paste("~", paste(matching_covariates, collapse = " + "))
+  
+  message("Matching criteria includes: ", length(matching_covariates), " variables")
+  
+  # Export current pathogen-specific formulas to individual cores
+  clusterExport(cl, varlist = c("pathogen", "formula_str", "exact_formula_str"), envir = environment())
+  
+  # Run 1000 iterations via Parallel Bootstrap
+  results <- pblapply(1:1000, function(i) analyze_once(i, pathogen, formula_str, exact_formula_str), cl = cl)
+  
+  # Combine the 1000 results for the current pathogen
+  all_results[[pathogen]] <- do.call(rbind, results)
+}
+
+# Close cluster and release resources
+stopCluster(cl)
+message("\nParallel computation completed")
+
+# Generate final detailed results
+final_results_detail <- do.call(rbind, all_results)
+```
